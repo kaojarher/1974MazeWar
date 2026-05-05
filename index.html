@@ -206,7 +206,7 @@ window.rndRoom = ()=>{
 //  GAME STATE
 // ─────────────────────────────
 const MAP_SIZE=22;
-let map=[],enemies=[],bullets=[],lasers=[];
+let map=[],enemies=[],bullets=[],lasers=[],healthpacks=[];
 let me={ x:1.5,y:1.5,dir:0,hp:10,maxHp:10,kills:0,lv:1,name:'PILOT',uid:'' };
 let peers={};   // uid -> state
 let isHost=false;
@@ -229,46 +229,95 @@ window.enter = ()=>{
 
   me.name=name;
   me.uid=name+'_'+Math.random().toString(36).slice(2,5).toUpperCase();
+  // seed from room code so all players get identical map
+  _mapSeed=[...code].reduce((a,c)=>((a<<5)-a+c.charCodeAt(0))|0,0);
   document.getElementById('rbroom').textContent=code;
   document.getElementById('hname').textContent=name;
 
-  setStatus('正在連接 '+chosenRelay+' ...');
-
-  // init GUN with chosen relay
-  gun=Gun({ peers:[chosenRelay], localStorage:false });
-  room_node=gun.get('mazewars_v3').get(code);
-
-  // 監聽所有玩家同步
-  room_node.get('players').map().on((data,uid)=>{
-    if(!data||uid===me.uid) return;
-    if(!peers[uid]) { logMsg('+ '+uid.slice(0,8)+' 進入戰場'); }
-    peers[uid]=data;
-    // 第一次收到別人資料且自己是最早進入者就成為 host
-    checkHost();
-  });
-
-  // 監聽敵人狀態（host 廣播）
-  room_node.get('world').on((data)=>{
-    if(!data||isHost) return;
+  if(typeof Gun !== 'undefined'){
     try{
-      const w=JSON.parse(data);
+      setStatus('正在連接...');
+      gun=Gun({ peers:[chosenRelay], localStorage:false });
+      room_node=gun.get('mazewars_v4').get(code);
+      setupGunListeners();
+    }catch(e){
+      console.warn('GUN error:', e);
+      room_node=null;
+      goSolo();
+    }
+  } else {
+    goSolo();
+  }
+  startGame();
+};
+
+function goSolo(){
+  setStatus('單機模式', true);
+  isHost=true;
+  setTimeout(initLevel, 100);
+}
+
+function setupGunListeners(){
+  let gotWorld=false;
+
+  // 立刻廣播自己上線（不等身份確定）
+  const broadcastSelf=()=>{
+    if(!room_node) return;
+    room_node.get('players').get(me.uid).put({
+      uid:me.uid, name:me.name,
+      x:me.x, y:me.y, dir:me.dir, hp:me.hp, ts:Date.now()
+    });
+  };
+  broadcastSelf();
+
+  // 監聽 host 廣播的 world
+  room_node.get('world').on((raw)=>{
+    if(!raw||isHost) return;
+    try{
+      const w=JSON.parse(raw);
+      if(!w.lv) return;
+      gotWorld=true;
+      me.lv=w.lv;
+      initLevel();
       if(w.enemies) enemies=w.enemies;
-      if(w.lv) me.lv=w.lv;
+      if(w.healthpacks) healthpacks=w.healthpacks;
     }catch(e){}
   });
 
-  // 監聽射擊事件
+  // 2.5s 後決定身份
+  setTimeout(()=>{
+    if(!isHost && !gotWorld){
+      isHost=true;
+      logMsg('你是本局 HOST');
+      initLevel();
+    } else if(!isHost){
+      logMsg('加入現有戰場');
+    }
+    setStatus('', true);
+  }, 2500);
+
+  // 監聽玩家清單（過濾 10 秒前的殘留資料）
+  room_node.get('players').map().on((data,uid)=>{
+    if(!data||uid===me.uid) return;
+    if(!data.x||!data.ts) return;
+    if(Date.now()-data.ts > 10000) return; // 忽略 10 秒前的舊資料
+    if(!peers[uid]) logMsg('+ '+(data.name||uid.slice(0,8))+' 進入戰場');
+    peers[uid]=data;
+    if(isHost) setTimeout(broadcastWorld, 200);
+    // 更新人數
+    document.getElementById('hpeers').textContent=Object.keys(peers).length+1;
+  });
+
+  // 監聽射擊
   room_node.get('shots').map().on((data,key)=>{
     if(!data||!isHost) return;
     try{
       const s=JSON.parse(data);
-      if(s.uid!==me.uid && Date.now()-s.ts<2000){
-        handleShoot(s.uid,s.dir,s.x,s.y);
-      }
+      if(s.uid!==me.uid && Date.now()-s.ts<2000) handleShoot(s.uid,s.dir,s.x,s.y);
     }catch(e){}
   });
 
-  // 監聽命中事件
+  // 監聽命中
   room_node.get('hits').map().on((data,key)=>{
     if(!data) return;
     try{
@@ -280,43 +329,28 @@ window.enter = ()=>{
       }
     }catch(e){}
   });
-
-  // 廣播自己上線
-  room_node.get('players').get(me.uid).put({ uid:me.uid, name:me.name,
-    x:me.x, y:me.y, dir:me.dir, hp:me.hp, ts:Date.now() });
-
-  setStatus('',true);
-  setTimeout(checkHost, 1500);
-
-  startGame();
-};
-
-function checkHost(){
-  // 若一秒內沒有任何 peer 或已是 host
-  if(isHost) return;
-  const otherTs=Object.values(peers).map(p=>p.ts||0);
-  const allOlder=otherTs.every(t=>t>me._startTs);
-  // 最小 uid 的人當 host（確定性）
-  const myKey=me.uid;
-  const allKeys=[myKey,...Object.keys(peers)].sort();
-  if(allKeys[0]===myKey){
-    isHost=true;
-    logMsg('你是本局 HOST');
-    initLevel();
-  }
 }
-// 記錄自己的進入時間
-window.addEventListener('DOMContentLoaded',()=>{ me._startTs=Date.now(); });
+
+
 
 // ─────────────────────────────
 //  MAZE (recursive backtracker)
 // ─────────────────────────────
+// ── 可重現的偽亂數（seed-based）──
+function mkRng(seed){
+  let s=seed|0;
+  return ()=>{ s=(s^(s<<13))>>>0; s=(s^(s>>7))>>>0; s=(s^(s<<17))>>>0; return s/4294967296; };
+}
+
+let _mapSeed=0; // 由 SECTOR code 決定，雙方相同
+
 function initLevel(){
+  const rng=mkRng(_mapSeed + me.lv * 999983);
   map=Array.from({length:MAP_SIZE},()=>Array(MAP_SIZE).fill(1));
   const vis=Array.from({length:MAP_SIZE},()=>Array(MAP_SIZE).fill(false));
   function carve(x,y){
     vis[y][x]=true; map[y][x]=0;
-    [[0,-2],[2,0],[0,2],[-2,0]].sort(()=>Math.random()-.5).forEach(([dx,dy])=>{
+    [[0,-2],[2,0],[0,2],[-2,0]].sort(()=>rng()-.5).forEach(([dx,dy])=>{
       const nx=x+dx,ny=y+dy;
       if(nx>0&&nx<MAP_SIZE-1&&ny>0&&ny<MAP_SIZE-1&&!vis[ny][nx]){
         map[y+dy/2][x+dx/2]=0; carve(nx,ny);
@@ -329,13 +363,26 @@ function initLevel(){
   enemies=[];
   const cnt=3+me.lv*2;
   for(let i=0;i<cnt;i++){
-    let ex,ey;
-    do{ex=Math.floor(Math.random()*MAP_SIZE);ey=Math.floor(Math.random()*MAP_SIZE);}
-    while(map[ey][ex]!==0||(Math.abs(ex-1)<3&&Math.abs(ey-1)<3));
-    enemies.push({x:ex+.5,y:ey+.5,dir:Math.random()*Math.PI*2,hp:2,alive:true,id:'e'+i});
+    let ex,ey,tries=0;
+    do{
+      ex=Math.floor(rng()*MAP_SIZE);
+      ey=Math.floor(rng()*MAP_SIZE);
+      tries++;
+    }while((map[ey]?.[ex]!==0||(Math.abs(ex-1)<3&&Math.abs(ey-1)<3))&&tries<200);
+    enemies.push({x:ex+.5,y:ey+.5,dir:rng()*Math.PI*2,hp:2,alive:true,id:'e'+i});
   }
+
+  // 補血包：每關放 3 個，位置用 seed 決定
+  healthpacks=[];
+  for(let i=0;i<3;i++){
+    let hx,hy,tries=0;
+    do{ hx=Math.floor(rng()*MAP_SIZE); hy=Math.floor(rng()*MAP_SIZE); tries++; }
+    while((map[hy]?.[hx]!==0||(Math.abs(hx-1)<3&&Math.abs(hy-1)<3))&&tries<200);
+    healthpacks.push({x:hx+.5,y:hy+.5,alive:true});
+  }
+
   bullets=[]; lasers=[];
-  broadcastWorld();
+  if(isHost) broadcastWorld();
 }
 
 // ─────────────────────────────
@@ -380,6 +427,15 @@ function update(dt){
   }
   move(mx,my);
 
+  // 撿補血包
+  healthpacks.forEach(h=>{
+    if(h.alive&&Math.hypot(me.x-h.x,me.y-h.y)<0.6){
+      h.alive=false;
+      me.hp=Math.min(me.maxHp,me.hp+4);
+      updateHUD(); logMsg('撿到補血包 +4 HP');
+    }
+  });
+
   // laser decay
   lasers=lasers.filter(l=>{ l.life-=dt; return l.life>0; });
 
@@ -409,8 +465,8 @@ function update(dt){
       const ny=en.y+Math.sin(en.dir)*.8*dt;
       if(map[Math.floor(ny)]?.[Math.floor(nx)]===0){en.x=nx;en.y=ny}
       else en.dir+=Math.PI*.5*(Math.random()>.5?1:-1);
-      // 偶爾攻擊玩家
-      if(Math.random()<.004&&Math.hypot(en.x-me.x,en.y-me.y)<5){
+      // 偶爾攻擊玩家（需視線無牆阻擋）
+      if(Math.random()<.004&&Math.hypot(en.x-me.x,en.y-me.y)<5&&hasLOS(en.x,en.y,me.x,me.y)){
         me.hp=Math.max(0,me.hp-1); flashDmg(); updateHUD();
         if(me.hp<=0) respawn();
       }
@@ -476,6 +532,10 @@ function handleShoot(uid,dir,sx,sy){
     }
   });
   // 擊中其他玩家
+  healthpacks.forEach(h=>{
+    if(!h.alive) return;
+    mmc.fillStyle='#ff0'; mmc.fillRect(h.x*cs-2,h.y*cs-2,4,4);
+  });
   Object.values(peers).forEach(p=>{
     if(!p.x) return;
     const a=Math.atan2(p.y-sy,p.x-sx);
@@ -496,8 +556,15 @@ function respawn(){
 //  DDA RAYCASTING RENDERER (Gemini-style)
 // ─────────────────────────────
 function draw(){
-  if(!map.length){ctx.fillStyle='#000';ctx.fillRect(0,0,gc.width,gc.height);return}
   const W=gc.width, H=gc.height;
+  if(!map.length||!map[0]){
+    ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#00ff41';ctx.font='bold 16px monospace';
+    ctx.textAlign='center';
+    ctx.fillText('正在同步地圖...', W/2, H/2);
+    ctx.textAlign='left';
+    return;
+  }
   const fd=me.dir;
   const FOV=Math.PI/3;
 
@@ -571,6 +638,7 @@ function draw(){
   const allSprites=[];
   enemies.forEach(en=>{ if(en.alive) allSprites.push({x:en.x,y:en.y,col:'#00ff41',lbl:''}); });
   Object.values(peers).forEach(p=>{ if(p.x!=null) allSprites.push({x:p.x,y:p.y,col:'#00e5ff',lbl:p.name||'?'}); });
+  healthpacks.forEach(h=>{ if(h.alive) allSprites.push({x:h.x,y:h.y,col:'#ffdd00',lbl:'+HP',isHP:true}); });
   allSprites.sort((a,b)=>Math.hypot(b.x-me.x,b.y-me.y)-Math.hypot(a.x-me.x,a.y-me.y));
   allSprites.forEach(s=>drawEye(s.x,s.y,zBuf,s.col,s.lbl,W,H,FOV));
 
@@ -662,6 +730,14 @@ function syncGun(){
     uid:me.uid, name:me.name,
     x:me.x, y:me.y, dir:me.dir, hp:me.hp, ts:Date.now()
   });
+  // 清除超過 8 秒沒更新的玩家（斷線偵測）
+  const now=Date.now();
+  Object.keys(peers).forEach(uid=>{
+    if(now-(peers[uid].ts||0)>8000){
+      logMsg('- '+(peers[uid].name||uid.slice(0,8))+' 離線');
+      delete peers[uid];
+    }
+  });
   document.getElementById('hpeers').textContent=Object.keys(peers).length+1;
 }
 
@@ -669,6 +745,7 @@ function broadcastWorld(){
   if(!room_node||!isHost) return;
   room_node.get('world').put(JSON.stringify({
     enemies: enemies.map(e=>({x:e.x,y:e.y,dir:e.dir,alive:e.alive,id:e.id})),
+    healthpacks: healthpacks.map(h=>({x:h.x,y:h.y,alive:h.alive})),
     lv: me.lv, ts: Date.now()
   }));
 }
